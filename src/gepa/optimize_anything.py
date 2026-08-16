@@ -297,6 +297,8 @@ def _run_engine(server: EvalServer, engine: Engine, *, owns_server: bool) -> Res
     result.metadata["budget"] = server.budget.status()
     adapter_cost = float(result.metadata.get("adapter_cost", 0.0))
     result.metadata["total_cost"] = server.total_cost + adapter_cost
+    adapter_cost_status = result.metadata.get("adapter_cost_status", "observed")
+    result.metadata["total_cost_status"] = "partial_unknown" if adapter_cost_status == "unknown" else "observed"
     result.metadata["progress_log"] = server.progress_log
     result.metadata["engine"] = engine.name
     if server.output_dir is not None:

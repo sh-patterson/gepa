@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, cast
 
+from gepa.oa.agent_runtime import AgentRunner, AgentRunRequest
 from gepa.oa.budget import BudgetExhausted, BudgetTracker
 from gepa.oa.engine import Result
 from gepa.oa.sandbox import DENY_WEB_TOOLS, bwrap_prefix, claude_permission_args, preflight_claude_engine
@@ -53,9 +54,14 @@ class MetaHarnessConfig:
     max_candidates_per_iter: int = 3
     effort: str | None = None
     max_thinking_tokens: int | None = None
+    agent_runner: AgentRunner | None = None
+    agent_timeout_seconds: float = 600.0
 
     def __post_init__(self) -> None:
         self.max_candidates_per_iter = max(1, int(self.max_candidates_per_iter))
+        self.agent_timeout_seconds = float(self.agent_timeout_seconds)
+        if self.agent_timeout_seconds <= 0:
+            raise ValueError("agent_timeout_seconds must be positive")
 
 
 SKILL_MD = """\
@@ -233,6 +239,9 @@ def _materialize_sandbox(work_dir: Path, task: Task, server: EvalServer, budget:
     skill_dir = work_dir / ".claude" / "skills" / "gepa-optimize-anything-meta-harness"
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(SKILL_MD)
+    codex_skill_dir = work_dir / ".agents" / "skills" / "gepa-optimize-anything-meta-harness"
+    codex_skill_dir.mkdir(parents=True, exist_ok=True)
+    (codex_skill_dir / "SKILL.md").write_text(SKILL_MD)
 
     agents_dir = work_dir / "agents"
     agents_dir.mkdir(exist_ok=True)
@@ -289,6 +298,8 @@ def _run_proposer(
     log_dir: Path,
     max_thinking_tokens: int | None = None,
     sandbox: bool = True,
+    agent_runner: AgentRunner | None = None,
+    agent_timeout_seconds: float = 600.0,
 ) -> tuple[int, float, str]:
     state = work_dir / "state"
     prompt = (
@@ -302,10 +313,49 @@ def _run_proposer(
         f"- state/reports/: `{state / 'reports'}`\n"
         f"- agents/: `{work_dir / 'agents'}`\n"
         f"- Write pending_eval.json to: `{pending_path}`\n\n"
-        f"Follow the gepa-optimize-anything-meta-harness skill in `.claude/skills/`."
+        "Follow the gepa-optimize-anything-meta-harness skill in "
+        f"`{'.agents/skills/' if agent_runner is not None else '.claude/skills/'}`."
     )
 
     session_id = str(uuid.uuid4())
+    if agent_runner is not None:
+        if max_budget_usd is not None:
+            raise ValueError("max_token_cost requires a runner with observed USD cost")
+        result = agent_runner.run(
+            AgentRunRequest(
+                continuation_id=session_id,
+                resume=False,
+                prompt=prompt,
+                cwd=work_dir,
+                model=model,
+                reasoning_effort=effort,
+                sandbox="workspace-write",
+                timeout_seconds=agent_timeout_seconds,
+            )
+        )
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / f"iter{iteration}_stdout.json").write_text(result.text)
+        (log_dir / f"iter{iteration}_stderr.txt").write_text("" if result.status == "completed" else result.status)
+        (log_dir / f"iter{iteration}_meta.json").write_text(
+            json.dumps(
+                {
+                    "iteration": iteration,
+                    "session_id": session_id,
+                    "runtime_thread_id": result.thread_id,
+                    "status": result.status,
+                    "cost_status": "unknown" if result.cost_usd is None else "observed",
+                    "cost_usd": result.cost_usd,
+                    "usage": result.usage,
+                },
+                indent=2,
+            )
+        )
+        return (
+            0 if result.status == "completed" else 1,
+            result.cost_usd or 0.0,
+            result.thread_id,
+        )
+
     cmd: list[str] = bwrap_prefix(work_dir) if sandbox else []
     cmd += [
         "claude",
@@ -634,6 +684,8 @@ class MetaHarnessEngine:
         self.max_candidates_per_iter = engine_config.max_candidates_per_iter
         self.effort = engine_config.effort
         self.max_thinking_tokens = engine_config.max_thinking_tokens
+        self.agent_runner = engine_config.agent_runner
+        self.agent_timeout_seconds = engine_config.agent_timeout_seconds
         self.run_dir = config.run_dir
         self.stop_at_score = config.stop_at_score
         self.sandbox = config.sandbox
@@ -644,7 +696,10 @@ class MetaHarnessEngine:
         self._pending_tempdir: tempfile.TemporaryDirectory[str] | None = None
 
     def run(self, task: Task, server: EvalServer) -> Result:
-        preflight_claude_engine(self.name, sandbox=bool(self.sandbox))
+        if self.agent_runner is None:
+            preflight_claude_engine(self.name, sandbox=bool(self.sandbox))
+        elif self.max_token_cost is not None:
+            raise ValueError("max_token_cost requires a runner with observed USD cost")
         budget = server.budget
 
         # When sandbox=True, force tempdir work_dir even if run_dir is set —
@@ -711,6 +766,8 @@ class MetaHarnessEngine:
                 log_dir=sessions_dir,
                 max_thinking_tokens=self.max_thinking_tokens,
                 sandbox=bool(self.sandbox),
+                agent_runner=self.agent_runner,
+                agent_timeout_seconds=self.agent_timeout_seconds,
             )
             propose_time = time.time() - propose_start
             total_proposer_cost += cost
@@ -920,6 +977,7 @@ class MetaHarnessEngine:
             eval_log=server.eval_log,
             metadata={
                 "adapter_cost": total_proposer_cost,
+                "adapter_cost_status": ("unknown" if self.agent_runner is not None else "observed"),
                 "meta_harness": {
                     "iterations_run": iteration,
                     "stop_reason": stop_reason,

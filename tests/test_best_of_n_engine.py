@@ -32,6 +32,7 @@ class _FakeLM:
 
     def __init__(self, *args, **kwargs):
         self.total_cost = 0.0
+        self.cost_status = "unknown"
         self._n = 0
 
     def __call__(self, prompt):
@@ -91,4 +92,6 @@ def test_val_only_task_scores_over_val_set(monkeypatch):
 
     # eval_fn ignores the candidate, so every sample scores mean(0.2, 0.8)=0.5.
     assert result.best_score == 0.5
-    assert budget.used == 3 * len(val)  # 3 samples × 2 val examples, no crash
+    assert budget.used == 3 * len(val)  # 3 samples x 2 val examples, no crash
+    assert result.metadata["adapter_cost"] == 0
+    assert result.metadata["adapter_cost_status"] == "unknown"

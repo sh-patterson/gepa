@@ -90,6 +90,36 @@ class OptimizeAnythingAdaptiveSequentialTests(unittest.TestCase):
         self.assertEqual(result.best_candidate, "aggregate-best")
         self.assertEqual(result.best_score, 0.5)
 
+    def test_propagates_unknown_adapter_cost_across_slices(self) -> None:
+        server = EvalServer(
+            Task(name="task", seed_candidate="seed"),
+            _evaluate,
+            BudgetTracker(max_evals=1),
+            max_concurrency=1,
+        )
+        configs = [OptimizeAnythingConfig(engine="best_of_n")]
+
+        def fake_optimize(active_server, cfg):
+            del cfg
+            active_server.evaluate("candidate")
+            return SimpleNamespace(
+                best_candidate="candidate",
+                best_score=1.0,
+                metadata={"adapter_cost": 0.0, "adapter_cost_status": "unknown"},
+            )
+
+        with patch("gepa.oa.ensemble.optimize_anything_with_server", side_effect=fake_optimize):
+            result = optimize_adaptive_sequential_with_server(
+                server,
+                configs,
+                plateau_evals=1,
+                patience=1,
+                min_evals_per_stage=1,
+            )
+
+        self.assertEqual(result.metadata["adapter_cost"], 0.0)
+        self.assertEqual(result.metadata["adapter_cost_status"], "unknown")
+
     def test_does_not_start_new_slice_below_minimum_remaining_budget(self) -> None:
         server = EvalServer(
             Task(name="task", seed_candidate="seed"),

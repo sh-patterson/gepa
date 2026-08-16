@@ -205,7 +205,7 @@ class BestOfNEngine:
                     "score": score,
                     "best_score": best_score,
                     "candidate_len": len(candidate),
-                    "lm_cost": lm.total_cost,
+                    "lm_cost": float(lm.total_cost or 0.0),
                     "eval_cost": server.total_cost,
                 }
             )
@@ -222,7 +222,8 @@ class BestOfNEngine:
             total_evals=n_samples,
             eval_log=eval_log,
             metadata={
-                "adapter_cost": lm.total_cost,
+                "adapter_cost": float(lm.total_cost or 0.0),
+                "adapter_cost_status": getattr(lm, "cost_status", "observed"),
                 "n_samples": n_samples,
                 "n_parse_failures": n_parse_failures,
                 "model": self.model,

@@ -304,6 +304,9 @@ def optimize_adaptive_sequential(
     # whole run now that the scheduler has restored the shared budget.
     result.metadata["budget"] = server.budget.status()
     result.metadata["total_cost"] = server.total_cost + float(result.metadata.get("adapter_cost", 0.0))
+    result.metadata["total_cost_status"] = (
+        "partial_unknown" if result.metadata.get("adapter_cost_status") == "unknown" else "observed"
+    )
 
     baseline_test = _score_test(server, task, task.seed_candidate)
     if result.best_candidate == task.seed_candidate:
@@ -573,6 +576,7 @@ def optimize_adaptive_sequential_with_server(
     switches = 0
     idle_slices_in_round = 0
     adapter_cost = 0.0
+    adapter_cost_status = "observed"
 
     try:
         while not server.budget.exhausted:
@@ -608,6 +612,9 @@ def optimize_adaptive_sequential_with_server(
             stage_results.append(result)
             result_cost = float(result.metadata.get("adapter_cost", 0.0))
             adapter_cost += result_cost
+            result_cost_status = str(result.metadata.get("adapter_cost_status", "observed"))
+            if result_cost_status == "unknown":
+                adapter_cost_status = "unknown"
 
             improved = result.best_score > before_best + improvement_epsilon
             if best_so_far is None or result.best_score > best_so_far.best_score + improvement_epsilon:
@@ -631,6 +638,7 @@ def optimize_adaptive_sequential_with_server(
                     "best_after": best_so_far.best_score if best_so_far is not None else float("-inf"),
                     "improved": improved,
                     "adapter_cost": result_cost,
+                    "adapter_cost_status": result_cost_status,
                 }
             )
 
@@ -682,6 +690,7 @@ def optimize_adaptive_sequential_with_server(
     final.metadata["adaptive_schedule"] = schedule
     final.metadata["adaptive_switches"] = switches
     final.metadata["adapter_cost"] = adapter_cost
+    final.metadata["adapter_cost_status"] = adapter_cost_status
     final.metadata["best_stage_score"] = best_so_far.best_score if best_so_far is not None else final.best_score
     final.metadata["best_stage_candidate"] = (
         best_so_far.best_candidate if best_so_far is not None else final.best_candidate

@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from gepa.oa.agent_runtime import AgentRunner, AgentRunRequest
 from gepa.oa.budget import BudgetTracker
 from gepa.oa.engine import Result
 from gepa.oa.engines.claude_utils import copy_session_transcript
@@ -69,6 +70,8 @@ class AutoResearchConfig:
     handoffs: list[dict[str, Any]] | None = None
     effort: str | None = None
     max_thinking_tokens: int | None = None
+    agent_runner: AgentRunner | None = None
+    agent_timeout_seconds: float = 600.0
 
     def __post_init__(self) -> None:
         # yaml/CLI may pass ralph as a string ("false") and max_no_eval_seconds
@@ -76,6 +79,9 @@ class AutoResearchConfig:
         self.ralph = _config_bool(self.ralph)
         if self.max_no_eval_seconds is not None:
             self.max_no_eval_seconds = float(self.max_no_eval_seconds)
+        self.agent_timeout_seconds = float(self.agent_timeout_seconds)
+        if self.agent_timeout_seconds <= 0:
+            raise ValueError("agent_timeout_seconds must be positive")
 
 
 # Nudge fed to claude --resume on each Ralph iteration.
@@ -495,6 +501,8 @@ class AutoResearchEngine:
         self.handoffs = engine_config.handoffs
         self.effort = engine_config.effort
         self.max_thinking_tokens = engine_config.max_thinking_tokens
+        self.agent_runner = engine_config.agent_runner
+        self.agent_timeout_seconds = engine_config.agent_timeout_seconds
         self.run_dir = config.run_dir
         self.stop_at_score = config.stop_at_score
         self.sandbox = config.sandbox
@@ -504,7 +512,10 @@ class AutoResearchEngine:
         self._pending_tempdir: tempfile.TemporaryDirectory[str] | None = None
 
     def run(self, task: Task, server: EvalServer) -> Result:
-        preflight_claude_engine(self.name, sandbox=bool(self.sandbox))
+        if self.agent_runner is None:
+            preflight_claude_engine(self.name, sandbox=bool(self.sandbox))
+        elif self.max_token_cost is not None:
+            raise ValueError("max_token_cost requires a runner with observed USD cost")
         budget = server.budget
         initial_candidate = seed_as_text(task.seed_candidate)
 
@@ -596,29 +607,25 @@ class AutoResearchEngine:
         adapter_cost += iter_cost
         invocations.append({"cost": iter_cost, "score": iteration_score, "returncode": proc.returncode})
 
-        if self.ralph:
+        if self.ralph and (self.agent_runner is None or budget.used > 0):
             while ralph_iterations < _RALPH_SAFETY_ITERATION_CAP:
                 if _saw_budget_exhausted(proc):
                     break
                 if not self._has_budget_headroom(server, adapter_cost):
                     break
-                if (
-                    self.stop_at_score is not None
-                    and best_score >= self.stop_at_score
-                ):
+                if self.stop_at_score is not None and best_score >= self.stop_at_score:
                     break
                 if proc.returncode != 0:
                     break
                 evaluation_session_id = server.open_evaluation_session(initial_candidate)
                 eval_script = work_dir / f"eval-{ralph_iterations + 1}.sh"
                 try:
-                    _materialize_eval_script(
-                        work_dir, task, server, evaluation_session_id, eval_script.name
-                    )
+                    _materialize_eval_script(work_dir, task, server, evaluation_session_id, eval_script.name)
                 except BaseException:
                     server.close_evaluation_session(evaluation_session_id, timeout=self._drain_timeout())
                     raise
                 iteration_prompt = f"{RALPH_CONTINUE_PROMPT} Use {eval_script} for this invocation."
+                evals_before_iteration = budget.used
                 proc, iteration_candidate, iteration_score = self._run_evaluation_iteration(
                     server,
                     task,
@@ -641,9 +648,11 @@ class AutoResearchEngine:
                 if proc.returncode != 0:
                     break
                 ralph_iterations += 1
+                if self.agent_runner is not None and budget.used == evals_before_iteration:
+                    break
                 # Iteration produced no measurable cost — agent likely
                 # has no more progress to make. Stop spending.
-                if iter_cost < 0.001:
+                if self.agent_runner is None and iter_cost < 0.001:
                     break
 
         return Result(
@@ -653,6 +662,7 @@ class AutoResearchEngine:
             eval_log=server.eval_log,
             metadata={
                 "adapter_cost": adapter_cost,
+                "adapter_cost_status": ("unknown" if self.agent_runner is not None else "observed"),
                 "session_id": session_id,
                 "work_dir": str(work_dir),
                 "ralph_iterations": ralph_iterations,
@@ -707,6 +717,58 @@ class AutoResearchEngine:
           * the eval-count budget reported exhausted ``_BUDGET_EXHAUSTION_GRACE_SECONDS``
             ago (giving in-flight 429s time to drain).
         """
+        if self.agent_runner is not None:
+            last_eval_used = budget.used
+            last_eval_time = time.monotonic()
+            exhausted_since: float | None = None
+
+            def stop_requested() -> str | None:
+                nonlocal last_eval_used, last_eval_time, exhausted_since
+                now = time.monotonic()
+                if budget.used != last_eval_used:
+                    last_eval_used = budget.used
+                    last_eval_time = now
+                if self.max_no_eval_seconds is not None and now - last_eval_time >= self.max_no_eval_seconds:
+                    return (
+                        f"NO_EVAL_PROGRESS: native agent exceeded {self.max_no_eval_seconds:.1f}s without eval progress"
+                    )
+                if budget.exhausted:
+                    if exhausted_since is None:
+                        exhausted_since = now
+                    elif now - exhausted_since >= _BUDGET_EXHAUSTION_GRACE_SECONDS:
+                        return "BUDGET_EXHAUSTED: native agent exceeded exhaustion grace"
+                else:
+                    exhausted_since = None
+                return None
+
+            result = self.agent_runner.run(
+                AgentRunRequest(
+                    continuation_id=session_id,
+                    resume=resume,
+                    prompt=prompt,
+                    cwd=work_dir,
+                    model=self.model,
+                    reasoning_effort=self.effort,
+                    sandbox="workspace-write",
+                    timeout_seconds=self.agent_timeout_seconds,
+                    stop_requested=stop_requested,
+                )
+            )
+            payload = {
+                "is_error": result.status != "completed",
+                "session_id": session_id,
+                "result": result.text,
+                "usage": result.usage,
+                "total_cost_usd": result.cost_usd or 0.0,
+                "runtime_thread_id": result.thread_id,
+            }
+            return subprocess.CompletedProcess(
+                ["agent_runner", session_id],
+                0 if result.status == "completed" else 1,
+                json.dumps(payload),
+                "" if result.status == "completed" else result.status,
+            )
+
         cmd: list[str] = bwrap_prefix(work_dir) if self.sandbox else []
         cmd += [
             "claude",
@@ -779,7 +841,6 @@ class AutoResearchEngine:
 
     def _drain_timeout(self) -> float:
         return self.max_no_eval_seconds if self.max_no_eval_seconds is not None else _BUDGET_EXHAUSTION_GRACE_SECONDS
-
 
     def process_result(self, result: Result, output_dir: Path | None) -> None:
         # Prefer ``self.run_dir`` when the caller's server has no output_dir:

@@ -135,6 +135,7 @@ class GepaEngine:
         # Reflection/proposer spend for this run, read straight off the cost
         # source's cumulative total_cost (it started fresh).
         adapter_cost = float(getattr(cost_source, "total_cost", 0.0) or 0.0) if cost_source is not None else 0.0
+        adapter_cost_status = getattr(cost_source, "cost_status", "observed") if cost_source is not None else "observed"
 
         if gepa_result is not None:
             best = gepa_result.best_candidate
@@ -147,14 +148,21 @@ class GepaEngine:
                 best_score=gepa_result.val_aggregate_scores[gepa_result.best_idx],
                 total_evals=server.budget.used,
                 eval_log=server.eval_log,
-                metadata={"gepa_result": gepa_result, "adapter_cost": adapter_cost},
+                metadata={
+                    "gepa_result": gepa_result,
+                    "adapter_cost": adapter_cost,
+                    "adapter_cost_status": adapter_cost_status,
+                },
             )
         return Result(
             best_candidate=cast(str, server.best_candidate),
             best_score=server.best_score,
             total_evals=server.budget.used,
             eval_log=server.eval_log,
-            metadata={"adapter_cost": adapter_cost},
+            metadata={
+                "adapter_cost": adapter_cost,
+                "adapter_cost_status": adapter_cost_status,
+            },
         )
 
     def process_result(self, result: Result, output_dir: Path | None) -> None:
